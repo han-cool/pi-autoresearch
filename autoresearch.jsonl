@@ -1,3 +1,4 @@
 {"type":"config","name":"Optimize toy benchmark (test loop)","metricName":"elapsed_ms","metricUnit":"ms","bestDirection":"lower"}
 {"run":1,"commit":"80582b2","metric":131.1,"metrics":{},"status":"keep","description":"Baseline: deliberate String conversion slowSum, 131.1ms","timestamp":1773242721215}
 {"run":2,"commit":"2f78c42","metric":10.1,"metrics":{},"status":"keep","description":"Remove String conversions in hot loop — direct addition","timestamp":1773242733112}
+{"run":3,"commit":"668674f","metric":0,"metrics":{},"status":"keep","description":"Use closed-form formula n*(n-1)/2 — O(1) instead of O(n)","timestamp":1773242743195}
