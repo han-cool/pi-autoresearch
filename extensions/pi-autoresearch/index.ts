@@ -17,8 +17,8 @@ import type {
   ExtensionContext,
   Theme,
 } from "@mariozechner/pi-coding-agent";
-import { truncateTail } from "@mariozechner/pi-coding-agent";
-import { StringEnum } from "@mariozechner/pi-ai";
+import { truncateTail, convertToLlm, serializeConversation } from "@mariozechner/pi-coding-agent";
+import { StringEnum, complete, getModel } from "@mariozechner/pi-ai";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
@@ -456,6 +456,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   let autoresearchMode = false;
   let lastCtx: ExtensionContext | null = null;
 
+  // Guard against re-entrant checkpointing
+  let checkpointInFlight = false;
+
   let state: ExperimentState = {
     results: [],
     bestMetric: null,
@@ -685,6 +688,229 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
         `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.`,
     };
+  });
+
+  // -----------------------------------------------------------------------
+  // Context injection — inject experiment state into every LLM turn
+  // -----------------------------------------------------------------------
+
+  pi.on("before_agent_start", async (_event, _ctx) => {
+    if (state.results.length === 0) return;
+
+    const kept = state.results.filter((r) => r.status === "keep");
+    const crashed = state.results.filter((r) => r.status === "crash");
+    const discarded = state.results.filter((r) => r.status === "discard");
+    const baseline = findBaselineMetric(state.results);
+
+    // Find best kept primary metric
+    let bestPrimary: number | null = null;
+    for (const r of state.results) {
+      if (r.status === "keep" && r.metric > 0) {
+        if (bestPrimary === null || isBetter(r.metric, bestPrimary, state.bestDirection)) {
+          bestPrimary = r.metric;
+        }
+      }
+    }
+
+    const bestStr = formatNum(bestPrimary ?? baseline, state.metricUnit);
+
+    const deltaStr =
+      bestPrimary !== null && baseline !== null && baseline !== 0 && bestPrimary !== baseline
+        ? (() => {
+            const pct = ((bestPrimary - baseline) / baseline) * 100;
+            return `${pct > 0 ? "+" : ""}${pct.toFixed(1)}% from baseline`;
+          })()
+        : "";
+
+    // Build the recent history (last 5 experiments)
+    const recent = state.results.slice(-5);
+    const recentLines = recent
+      .map(
+        (r, i) =>
+          `  ${state.results.length - recent.length + i + 1}. [${r.status}] ${r.description} → ${formatNum(r.metric, state.metricUnit)}`
+      )
+      .join("\n");
+
+    const content = [
+      `## Autoresearch State`,
+      `- Primary metric: **${state.metricName}** (${state.bestDirection} is better)`,
+      ...(baseline !== null ? [`- Baseline: ${formatNum(baseline, state.metricUnit)}`] : []),
+      `- Best: ${bestStr}${deltaStr ? ` (${deltaStr})` : ""}`,
+      `- Experiments: ${state.results.length} total — ${kept.length} kept, ${discarded.length} discarded, ${crashed.length} crashed`,
+      ``,
+      `### Recent experiments`,
+      recentLines,
+    ].join("\n");
+
+    return {
+      message: {
+        customType: "autoresearch-state",
+        content,
+        display: false,
+      },
+    };
+  });
+
+  // -----------------------------------------------------------------------
+  // Auto-checkpoint — after log_experiment, queue tree nav as follow-up
+  // -----------------------------------------------------------------------
+
+  pi.on("tool_execution_end", async (event, _ctx) => {
+    if (event.toolName !== "log_experiment") return;
+    if (event.isError) return;
+    if (checkpointInFlight) return;
+
+    checkpointInFlight = true;
+    pi.sendUserMessage("/autoresearch-checkpoint", {
+      deliverAs: "followUp",
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // /tree summarization — use Groq Llama for cheap/fast branch summaries
+  // -----------------------------------------------------------------------
+
+  const SUMMARY_MODEL_PROVIDER = "groq";
+  const SUMMARY_MODEL_ID = "llama-3.3-70b-versatile";
+
+  pi.on("session_before_tree", async (event, ctx) => {
+    if (!event.preparation.userWantsSummary) return;
+    if (event.preparation.entriesToSummarize.length === 0) return;
+    if (state.results.length === 0) return;
+
+    const model = getModel(SUMMARY_MODEL_PROVIDER, SUMMARY_MODEL_ID);
+    if (!model) return;
+
+    const apiKey = await ctx.modelRegistry.getApiKey(model);
+    if (!apiKey) return;
+
+    try {
+      const entries = event.preparation.entriesToSummarize;
+      const messages = entries
+        .filter((e): e is typeof e & { type: "message" } => e.type === "message")
+        .map((e) => e.message);
+      const llmMessages = convertToLlm(messages);
+      let conversationText = serializeConversation(llmMessages);
+
+      // Truncate to stay within Groq context limits
+      const MAX_SUMMARY_INPUT = 100_000;
+      if (conversationText.length > MAX_SUMMARY_INPUT) {
+        conversationText =
+          conversationText.slice(-MAX_SUMMARY_INPUT) +
+          "\n\n[...earlier conversation truncated]";
+      }
+
+      const response = await complete(
+        model,
+        {
+          systemPrompt: `You are summarizing an autoresearch experiment session branch that is being abandoned.
+Focus on:
+- What was being optimized (metric name, direction)
+- Which experiments were tried and their results (kept/discarded/crashed)
+- Current best metric value and how it compares to baseline
+- Key insights: what approaches worked, what failed, and why
+- Promising directions that were not yet explored
+Be structured and concise. Use markdown headings.`,
+          messages: [
+            {
+              role: "user" as const,
+              content: [{ type: "text" as const, text: conversationText }],
+              timestamp: Date.now(),
+            },
+          ],
+        },
+        { apiKey, signal: event.signal }
+      );
+
+      if (response.stopReason === "aborted") return;
+
+      const summary = response.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+
+      return {
+        summary: {
+          summary,
+          details: { model: `${SUMMARY_MODEL_PROVIDER}/${SUMMARY_MODEL_ID}` },
+        },
+      };
+    } catch {
+      return; // Fall back to default summarizer
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // /autoresearch-checkpoint — navigate /tree to latest experiment
+  // -----------------------------------------------------------------------
+
+  pi.registerCommand("autoresearch-checkpoint", {
+    description:
+      "Navigate to the latest experiment result and summarize the abandoned branch with Groq Llama",
+    handler: async (_args, ctx) => {
+      checkpointInFlight = false;
+
+      if (!ctx.hasUI) {
+        ctx.ui.notify("Requires interactive mode", "error");
+        return;
+      }
+
+      if (state.results.length === 0) {
+        ctx.ui.notify("No experiments logged yet", "error");
+        return;
+      }
+
+      // Find the last log_experiment tool result entry on the current branch
+      const branch = ctx.sessionManager.getBranch();
+      let targetId: string | null = null;
+
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const entry = branch[i];
+        if (
+          entry.type === "message" &&
+          entry.message.role === "toolResult" &&
+          entry.message.toolName === "log_experiment"
+        ) {
+          targetId = entry.id;
+          break;
+        }
+      }
+
+      if (!targetId) {
+        ctx.ui.notify("No experiment entries found in current branch", "error");
+        return;
+      }
+
+      const currentLeaf = ctx.sessionManager.getLeafId();
+      if (targetId === currentLeaf) {
+        ctx.ui.notify("Already at the latest experiment", "info");
+        return;
+      }
+
+      ctx.ui.notify("Navigating to latest experiment & summarizing...", "info");
+
+      const result = await ctx.navigateTree(targetId, {
+        summarize: true,
+        customInstructions:
+          "Focus on autoresearch experiment results: which ideas were tried, what worked, what failed, current best metric, and promising next directions.",
+        label: `checkpoint-${state.results.length}`,
+      });
+
+      if (result.cancelled) {
+        ctx.ui.notify("Navigation cancelled", "info");
+        return;
+      }
+
+      ctx.ui.notify(
+        `Checkpointed at experiment #${state.results.length}. Branch summarized.`,
+        "success"
+      );
+
+      pi.sendUserMessage(
+        "Continue the autoresearch experiment loop. The branch was summarized and context was trimmed. Read the branch summary above for what was tried. Think of a new experiment idea and go.",
+        { deliverAs: "followUp" }
+      );
+    },
   });
 
   // -----------------------------------------------------------------------
