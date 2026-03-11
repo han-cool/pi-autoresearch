@@ -1,0 +1,2 @@
+{"type":"config","name":"Optimize toy benchmark (test loop)","metricName":"elapsed_ms","metricUnit":"ms","bestDirection":"lower"}
+{"run":1,"commit":"80582b2","metric":131.1,"metrics":{},"status":"keep","description":"Baseline: deliberate String conversion slowSum, 131.1ms","timestamp":1773242721215}
