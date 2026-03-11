@@ -9,8 +9,7 @@ const N = 2_000_000;
 function slowSum(n) {
   let total = 0;
   for (let i = 0; i < n; i++) {
-    // Deliberately slow: convert to string and back
-    total = Number(String(total)) + Number(String(i));
+    total += i;
   }
   return total;
 }
