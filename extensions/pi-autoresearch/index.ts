@@ -459,15 +459,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Guard against re-entrant checkpointing
   let checkpointInFlight = false;
 
-  // The toolCallId of the log_experiment that triggered the checkpoint.
-  // Captured at tool_execution_end time so we navigate to THAT experiment,
-  // not the last one (which may be many experiments later in the same turn).
-  let checkpointTriggerToolCallId: string | null = null;
+  // When true, the next session_before_compact should use the custom summarizer.
+  // Set by the auto-checkpoint in turn_end, cleared after session_before_compact fires.
+  let useAutoresearchSummarizerForNextCompact = false;
 
-  // When true, the next session_before_tree should use the custom summarizer.
-  // Set by /autoresearch-checkpoint, cleared after session_before_tree fires.
-  // Prevents hijacking manual /tree navigation with autoresearch-focused summaries.
-  let useSummaryModelForNextTreeNav = false;
+
 
   let state: ExperimentState = {
     results: [],
@@ -759,34 +755,64 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
-  // Auto-checkpoint — after log_experiment, queue tree nav as follow-up
+  // Auto-checkpoint — after a turn with experiments, compact to free context
   // -----------------------------------------------------------------------
 
-  pi.on("tool_execution_end", async (event, _ctx) => {
-    if (event.toolName !== "log_experiment") return;
-    if (event.isError) return;
+  pi.on("turn_end", async (_event, ctx) => {
+    if (!autoresearchMode) return;
     if (checkpointInFlight) return;
 
+    // Only compact if we've logged experiments this session
+    if (state.results.length === 0) return;
+
+    // Check if context is getting large enough to warrant compaction
+    const usage = ctx.getContextUsage();
+    if (!usage || usage.percent === null || usage.percent < 30) return;
+
     checkpointInFlight = true;
-    checkpointTriggerToolCallId = event.toolCallId;
-    pi.sendUserMessage("/autoresearch-checkpoint", {
-      deliverAs: "followUp",
+    useAutoresearchSummarizerForNextCompact = true;
+
+    ctx.compact({
+      customInstructions:
+        "This is an autoresearch experiment session. Focus the summary on:\n" +
+        "- What is being optimized (metric name, direction, current best)\n" +
+        "- Which experiment ideas were tried and their results (kept/discarded/crashed)\n" +
+        "- Key insights: what approaches worked, what failed, and why\n" +
+        "- Promising directions not yet explored\n" +
+        "Preserve the experiment state and all metric values.",
+      onComplete: () => {
+        checkpointInFlight = false;
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            `Autoresearch checkpoint: compacted at ${state.results.length} experiments`,
+            "success"
+          );
+        }
+        // Continue the loop after compaction
+        pi.sendUserMessage(
+          "Continue the autoresearch experiment loop. Context was compacted. Read the summary above for what was tried. Think of a new experiment idea and go.",
+          { deliverAs: "followUp" }
+        );
+      },
+      onError: (error) => {
+        checkpointInFlight = false;
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Checkpoint compaction failed: ${error.message}`, "error");
+        }
+      },
     });
   });
 
   // -----------------------------------------------------------------------
-  // /tree summarization — use cheap/fast model for branch summaries
+  // Compaction summarization — use cheap/fast model for autoresearch compaction
   // -----------------------------------------------------------------------
 
   const SUMMARY_MODEL_PROVIDER = "groq";
   const SUMMARY_MODEL_ID = "llama-3.3-70b-versatile";
 
-  pi.on("session_before_tree", async (event, ctx) => {
-    if (!event.preparation.userWantsSummary) return;
-    if (event.preparation.entriesToSummarize.length === 0) return;
-    // Only intercept auto-triggered checkpoints, not manual /tree usage
-    if (!useSummaryModelForNextTreeNav) return;
-    useSummaryModelForNextTreeNav = false;
+  pi.on("session_before_compact", async (event, ctx) => {
+    if (!useAutoresearchSummarizerForNextCompact) return;
+    useAutoresearchSummarizerForNextCompact = false;
 
     const model = getModel(SUMMARY_MODEL_PROVIDER, SUMMARY_MODEL_ID);
     if (!model) return;
@@ -795,16 +821,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!apiKey) return;
 
     try {
-      const entries = event.preparation.entriesToSummarize;
+      const entries = event.branchEntries;
       const messages = entries
         .filter((e): e is typeof e & { type: "message" } => e.type === "message")
         .map((e) => e.message);
       const llmMessages = convertToLlm(messages);
       let conversationText = serializeConversation(llmMessages);
 
-      if (!conversationText.trim()) return; // Nothing to summarize
+      if (!conversationText.trim()) return;
 
-      // Truncate to stay within summarizer model context limits
       const MAX_SUMMARY_INPUT = 100_000;
       if (conversationText.length > MAX_SUMMARY_INPUT) {
         conversationText =
@@ -815,7 +840,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const response = await complete(
         model,
         {
-          systemPrompt: `You are summarizing an autoresearch experiment session branch that is being abandoned.
+          systemPrompt: `You are summarizing an autoresearch experiment session for compaction.
 Focus on:
 - What was being optimized (metric name, direction)
 - Which experiments were tried and their results (kept/discarded/crashed)
@@ -842,122 +867,18 @@ Be structured and concise. Use markdown headings.`,
         .join("\n");
 
       return {
-        summary: {
+        compaction: {
           summary,
-          details: { model: `${SUMMARY_MODEL_PROVIDER}/${SUMMARY_MODEL_ID}` },
+          firstKeptEntryId: event.preparation.firstKeptEntryId,
+          tokensBefore: event.preparation.tokensBefore,
         },
       };
     } catch (err) {
-      console.error("[autoresearch] Custom summarization failed, falling back to default:", err);
+      console.error("[autoresearch] Custom compaction summarization failed, falling back to default:", err);
       return;
     }
   });
 
-  // -----------------------------------------------------------------------
-  // /autoresearch-checkpoint — navigate /tree to latest experiment
-  // -----------------------------------------------------------------------
-
-  pi.registerCommand("autoresearch-checkpoint", {
-    // Internal command — triggered automatically by tool_execution_end after log_experiment.
-    // No description so it won't appear in command autocomplete.
-    handler: async (_args, ctx) => {
-      try {
-        // Guard: only allow extension-triggered invocations
-        if (!checkpointInFlight) {
-          ctx.ui.notify("autoresearch-checkpoint is internal — triggered automatically after log_experiment", "error");
-          return;
-        }
-
-        if (!ctx.hasUI) {
-          ctx.ui.notify("Requires interactive mode", "error");
-          return;
-        }
-
-        if (state.results.length === 0) {
-          ctx.ui.notify("No experiments logged yet", "error");
-          return;
-        }
-
-        // Capture count before navigation (reconstructState may change it)
-        const experimentCount = state.results.length;
-
-        // Find the log_experiment that TRIGGERED this checkpoint (not the last one).
-        // The agent may have run many more experiments in the same turn after the
-        // trigger. Navigating to the trigger point abandons those later experiments
-        // and summarizes them, giving a real token reduction.
-        const branch = ctx.sessionManager.getBranch();
-        let targetId: string | null = null;
-
-        if (checkpointTriggerToolCallId) {
-          // Primary: find the entry matching the trigger toolCallId
-          for (const entry of branch) {
-            if (
-              entry.type === "message" &&
-              entry.message.role === "toolResult" &&
-              entry.message.toolCallId === checkpointTriggerToolCallId
-            ) {
-              targetId = entry.id;
-              break;
-            }
-          }
-        }
-
-        if (!targetId) {
-          // Fallback: find the last log_experiment (original behavior)
-          for (let i = branch.length - 1; i >= 0; i--) {
-            const entry = branch[i];
-            if (
-              entry.type === "message" &&
-              entry.message.role === "toolResult" &&
-              entry.message.toolName === "log_experiment"
-            ) {
-              targetId = entry.id;
-              break;
-            }
-          }
-        }
-
-        if (!targetId) {
-          ctx.ui.notify("No experiment entries found in current branch", "error");
-          return;
-        }
-
-        const currentLeaf = ctx.sessionManager.getLeafId();
-        if (targetId === currentLeaf) {
-          ctx.ui.notify("Already at the latest experiment", "info");
-          return;
-        }
-
-        ctx.ui.notify("Navigating to latest experiment & summarizing...", "info");
-
-        useSummaryModelForNextTreeNav = true;
-        const result = await ctx.navigateTree(targetId, {
-          summarize: true,
-          customInstructions:
-            "Focus on autoresearch experiment results: which ideas were tried, what worked, what failed, current best metric, and promising next directions.",
-          label: `checkpoint-${experimentCount}`,
-        });
-
-        if (result.cancelled) {
-          ctx.ui.notify("Navigation cancelled", "info");
-          return;
-        }
-
-        ctx.ui.notify(
-          `Checkpointed at experiment #${experimentCount}. Branch summarized.`,
-          "success"
-        );
-
-        pi.sendUserMessage(
-          "Continue the autoresearch experiment loop. The branch was summarized and context was trimmed. Read the branch summary above for what was tried. Think of a new experiment idea and go.",
-          { deliverAs: "followUp" }
-        );
-      } finally {
-        checkpointInFlight = false;
-        checkpointTriggerToolCallId = null;
-      }
-    },
-  });
 
   // -----------------------------------------------------------------------
   // init_experiment tool — one-time setup
