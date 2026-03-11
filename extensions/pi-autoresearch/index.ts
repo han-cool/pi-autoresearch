@@ -852,10 +852,16 @@ Be structured and concise. Use markdown headings.`,
   // -----------------------------------------------------------------------
 
   pi.registerCommand("autoresearch-checkpoint", {
-    description:
-      "Navigate to the latest experiment result and summarize the abandoned branch with a fast summarizer model",
+    // Internal command — triggered automatically by tool_execution_end after log_experiment.
+    // No description so it won't appear in command autocomplete.
     handler: async (_args, ctx) => {
       try {
+        // Guard: only allow extension-triggered invocations
+        if (!checkpointInFlight) {
+          ctx.ui.notify("autoresearch-checkpoint is internal — triggered automatically after log_experiment", "error");
+          return;
+        }
+
         if (!ctx.hasUI) {
           ctx.ui.notify("Requires interactive mode", "error");
           return;
