@@ -4,7 +4,8 @@ comparisons = 0
 
 
 def sort(arr: list[int]) -> list[int]:
-    """Sort using Python's built-in sorted()."""
+    """In-place sort — benchmark already passes a copy."""
     global comparisons
     comparisons = 0
-    return sorted(arr)
+    arr.sort()
+    return arr

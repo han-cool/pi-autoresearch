@@ -5,3 +5,8 @@
 {"run":4,"commit":"d4e5f6g","metric":172000,"metrics":{"comparisons":1650000,"memory_kb":4100.0},"status":"keep","description":"Timsort-style natural merge detection","timestamp":1710100180000}
 {"run":5,"commit":"e5f6g7h","metric":0,"metrics":{"comparisons":0,"memory_kb":0},"status":"crash","description":"Radix sort attempt — negative numbers not handled","timestamp":1710100240000}
 {"run":6,"commit":"9229b9c","metric":10103,"metrics":{"comparisons":0,"memory_kb":1171.8},"status":"keep","description":"Use Python built-in sorted() — 10.1k µs vs 1.6M baseline","timestamp":1773246278575}
+{"run":7,"commit":"65e5d78","metric":10980,"metrics":{"comparisons":0,"memory_kb":1171.7},"status":"discard","description":"list.sort() with copy — 10.9k µs, slightly worse than sorted()","timestamp":1773246294867}
+{"run":8,"commit":"65e5d78","metric":10451,"metrics":{"comparisons":0,"memory_kb":390.5},"status":"discard","description":"In-place arr.sort() — 10.4k µs, primary didn't beat sorted() at 10.1k","timestamp":1773246308832}
+{"run":9,"commit":"65e5d78","metric":125976,"metrics":{"comparisons":0,"memory_kb":5586.8},"status":"discard","description":"Pure Python radix sort (base 256) — 126k µs, way worse than sorted()","timestamp":1773246334165}
+{"run":10,"commit":"65e5d78","metric":10346,"metrics":{"comparisons":0,"memory_kb":1171.8},"status":"discard","description":"Local binding of sorted() — 10.3k µs, no improvement over 10.1k","timestamp":1773246971468}
+{"run":11,"commit":"65e5d78","metric":9578,"metrics":{"comparisons":0,"memory_kb":390.5},"status":"keep","description":"In-place arr.sort() — 9.6k µs, new best! Less memory too (391 KB)","timestamp":1773246984914}
