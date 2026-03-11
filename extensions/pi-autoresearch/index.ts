@@ -459,6 +459,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Guard against re-entrant checkpointing
   let checkpointInFlight = false;
 
+  // The toolCallId of the log_experiment that triggered the checkpoint.
+  // Captured at tool_execution_end time so we navigate to THAT experiment,
+  // not the last one (which may be many experiments later in the same turn).
+  let checkpointTriggerToolCallId: string | null = null;
+
   // When true, the next session_before_tree should use the custom summarizer.
   // Set by /autoresearch-checkpoint, cleared after session_before_tree fires.
   // Prevents hijacking manual /tree navigation with autoresearch-focused summaries.
@@ -763,6 +768,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (checkpointInFlight) return;
 
     checkpointInFlight = true;
+    checkpointTriggerToolCallId = event.toolCallId;
     pi.sendUserMessage("/autoresearch-checkpoint", {
       deliverAs: "followUp",
     });
@@ -875,19 +881,39 @@ Be structured and concise. Use markdown headings.`,
         // Capture count before navigation (reconstructState may change it)
         const experimentCount = state.results.length;
 
-        // Find the last log_experiment tool result entry on the current branch
+        // Find the log_experiment that TRIGGERED this checkpoint (not the last one).
+        // The agent may have run many more experiments in the same turn after the
+        // trigger. Navigating to the trigger point abandons those later experiments
+        // and summarizes them, giving a real token reduction.
         const branch = ctx.sessionManager.getBranch();
         let targetId: string | null = null;
 
-        for (let i = branch.length - 1; i >= 0; i--) {
-          const entry = branch[i];
-          if (
-            entry.type === "message" &&
-            entry.message.role === "toolResult" &&
-            entry.message.toolName === "log_experiment"
-          ) {
-            targetId = entry.id;
-            break;
+        if (checkpointTriggerToolCallId) {
+          // Primary: find the entry matching the trigger toolCallId
+          for (const entry of branch) {
+            if (
+              entry.type === "message" &&
+              entry.message.role === "toolResult" &&
+              entry.message.toolCallId === checkpointTriggerToolCallId
+            ) {
+              targetId = entry.id;
+              break;
+            }
+          }
+        }
+
+        if (!targetId) {
+          // Fallback: find the last log_experiment (original behavior)
+          for (let i = branch.length - 1; i >= 0; i--) {
+            const entry = branch[i];
+            if (
+              entry.type === "message" &&
+              entry.message.role === "toolResult" &&
+              entry.message.toolName === "log_experiment"
+            ) {
+              targetId = entry.id;
+              break;
+            }
           }
         }
 
@@ -928,6 +954,7 @@ Be structured and concise. Use markdown headings.`,
         );
       } finally {
         checkpointInFlight = false;
+        checkpointTriggerToolCallId = null;
       }
     },
   });
