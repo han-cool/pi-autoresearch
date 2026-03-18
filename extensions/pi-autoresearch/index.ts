@@ -1359,9 +1359,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }, timeout);
         }
 
-        // Abort signal
+        // Abort signal — also handle race where signal fires before pid is assigned
         const onAbort = () => {
           if (child.pid) killTree(child.pid);
+          else child.once("spawn", () => { if (child.pid) killTree(child.pid); });
         };
         if (signal) {
           if (signal.aborted) {
